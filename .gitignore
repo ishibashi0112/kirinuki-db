@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+# packs written while trying the tool: real company data, never commit them
+*.xlsx
+!docs/sample-pack.xlsx

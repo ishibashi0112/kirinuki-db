@@ -1,0 +1,70 @@
+{
+  "name": "kirinuki-db",
+  "version": "0.1.0",
+  "description": "Cut the rows related to one record out of a company database, with what each table, column and code value means, into one Excel file for an AI chat.",
+  "type": "module",
+  "packageManager": "pnpm@10.28.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ishibashi0112/kirinuki-db.git"
+  },
+  "keywords": [
+    "database",
+    "excel",
+    "xlsx",
+    "sql-server",
+    "oracle",
+    "foreign-key",
+    "subset",
+    "copilot"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "bin": {
+    "kirinuki": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "mssql": ">=11",
+    "oracledb": ">=6",
+    "pg": ">=8"
+  },
+  "peerDependenciesMeta": {
+    "mssql": {
+      "optional": true
+    },
+    "oracledb": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/mssql": "^12.3.0",
+    "@types/node": "^22.20.5",
+    "@types/oracledb": "^7.0.3",
+    "@types/pg": "^8.23.1",
+    "mssql": "^12.7.4",
+    "oracledb": "^26.0.0",
+    "pg": "^8.23.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.3"
+  }
+}
