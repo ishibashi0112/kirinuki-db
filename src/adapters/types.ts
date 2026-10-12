@@ -1,4 +1,4 @@
-import type { ForeignKey, JsonValue, Row, TableInfo, TableRef } from "../core/types.js";
+import type { CatalogTable, ForeignKey, JsonValue, Row, TableInfo, TableRef } from "../core/types.js";
 
 /**
  * A read-only view of a database. Every method must work with SELECT permission only:
@@ -14,6 +14,8 @@ export interface DbAdapter {
   describeTable(table: TableRef): Promise<TableInfo>;
   /** Every declared foreign key between the tables this user can see. */
   foreignKeys(): Promise<ForeignKey[]>;
+  /** Columns, primary keys and indexes of every table at once (a few catalog queries, whatever the number of tables). */
+  catalog(): Promise<CatalogTable[]>;
   countRows(table: TableRef): Promise<number>;
   /**
    * The rows whose `columns` equal one of `keys` (tuples in the order of `columns`; no nulls),

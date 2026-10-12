@@ -5,6 +5,8 @@
  *   customers ← orders → order_items (order_id, line_no) → items → categories
  *                      ← shipments (not a detail: its key is ship_id)
  *   items ← stock (item_cd, wh_cd) → warehouses (wh_cd is CHAR(3) holding two characters: padded on most databases)
+ *   items ← item_prices: no primary key and no foreign key even in the declared version, only a unique index (item_cd, valid_from)
+ * An index on order_items (item_cd); none on shipments (order_id) or orders (customer_id).
  */
 export type Dialect = "sqlite" | "postgres" | "mssql" | "oracle";
 
@@ -15,9 +17,15 @@ const TYPES: Record<Dialect, Record<"int" | "code" | "text" | "money" | "time", 
   oracle: { int: () => "NUMBER(10)", code: (n) => `VARCHAR2(${n})`, text: (n) => `NVARCHAR2(${n})`, money: () => "NUMBER(10)", time: () => "DATE" },
 };
 
-export const TABLES = ["shipments", "stock", "order_items", "orders", "warehouses", "items", "customers", "categories"];
+export const TABLES = ["item_prices", "shipments", "stock", "order_items", "orders", "warehouses", "items", "customers", "categories"];
 
-export function salesSchema(d: Dialect): string[] {
+/** With `foreignKeys: false`, the same tables without a single REFERENCES: a work database that states relations by column names only. */
+export function salesSchema(d: Dialect, options: { foreignKeys?: boolean } = {}): string[] {
+  const statements = schema(d);
+  return options.foreignKeys === false ? statements.map((s) => s.replace(/ REFERENCES \w+ \(\w+\)/g, "")) : statements;
+}
+
+function schema(d: Dialect): string[] {
   const t = TYPES[d];
   const time = (s: string) => (d === "oracle" ? `TO_DATE('${s}', 'YYYY-MM-DD HH24:MI:SS')` : `'${s}'`);
   const n = (s: string) => (d === "mssql" || d === "oracle" ? `N'${s}'` : `'${s}'`);
@@ -35,6 +43,9 @@ export function salesSchema(d: Dialect): string[] {
     `CREATE TABLE stock (item_cd ${t.code(10)} NOT NULL REFERENCES items (item_cd), wh_cd CHAR(3) NOT NULL REFERENCES warehouses (wh_cd),
        qty ${t.int()}, PRIMARY KEY (item_cd, wh_cd))`,
     `CREATE TABLE shipments (ship_id ${t.int()} PRIMARY KEY, order_id ${t.int()} REFERENCES orders (order_id), shipped_at ${t.time()})`,
+    `CREATE TABLE item_prices (item_cd ${t.code(10)} NOT NULL, valid_from ${t.time()} NOT NULL, price ${t.money()})`,
+    `CREATE UNIQUE INDEX ux_item_prices ON item_prices (item_cd, valid_from)`,
+    `CREATE INDEX ix_order_items_item ON order_items (item_cd)`,
     ...rows("categories", [`1, NULL, ${n("機械部品")}`, `2, 1, ${n("ベアリング")}`, `3, NULL, ${n("販促物")}`]),
     ...rows("customers", [`7, ${n("得意先_0001")}, 'A'`, `12, ${n("得意先_0002")}, 'B'`]),
     ...rows("items", [
@@ -51,6 +62,11 @@ export function salesSchema(d: Dialect): string[] {
     ...rows("order_items", [`1042, 1, 'A-100', 10`, `1042, 2, 'B-210', 3`, `1043, 1, 'A-100', 5`, `1043, 2, 'C-001', 1`, `1044, 1, 'B-210', 2`]),
     ...rows("stock", [`'A-100', '10', 40`, `'A-100', '20', 12`, `'B-210', '10', 3`, `'C-001', '10', 200`]),
     ...rows("shipments", [`501, 1044, ${time("2026-09-21 15:00:00")}`, `502, 1042, ${time("2026-10-02 08:30:00")}`]),
+    ...rows("item_prices", [
+      `'A-100', ${time("2026-04-01 00:00:00")}, 450`,
+      `'A-100', ${time("2026-10-01 00:00:00")}, 480`,
+      `'B-210', ${time("2026-04-01 00:00:00")}, 320`,
+    ]),
   ];
 }
 

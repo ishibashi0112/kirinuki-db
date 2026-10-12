@@ -21,12 +21,20 @@ export interface Column {
 export interface TableInfo {
   table: TableRef;
   columns: Column[];
-  /** Primary key columns in key order. Empty when the table has none. */
+  /**
+   * Key columns in key order: the primary key, or for a table without one, the columns of its
+   * shortest unique index (`keyFromIndex`). Empty when the table has neither.
+   */
   primaryKey: string[];
+  keyFromIndex?: boolean;
   comment?: string;
 }
 
-/** A declared foreign key: `from.columns` reference `to.refColumns` (same order). */
+/**
+ * A relation between two tables: `from.columns` reference `to.refColumns` (same order).
+ * declared: a foreign key in the database; inferred: guessed from column names (see inferRelations);
+ * file: written in a relations file.
+ */
 export interface ForeignKey {
   name: string;
   /** The referencing table (the child: order_items). */
@@ -35,4 +43,14 @@ export interface ForeignKey {
   /** The referenced table (the parent: orders). */
   to: TableRef;
   refColumns: string[];
+  source?: "declared" | "inferred" | "file";
+}
+
+/** What `DbAdapter.catalog` tells about one table: enough to guess relations without reading rows. */
+export interface CatalogTable {
+  table: TableRef;
+  columns: { name: string; type: string }[];
+  primaryKey: string[];
+  /** Key columns of each index, primary key and unique constraints included. Expression indexes are left out. */
+  indexes: { columns: string[]; unique: boolean }[];
 }

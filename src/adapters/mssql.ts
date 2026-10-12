@@ -1,5 +1,5 @@
 import { exactDecimal, normalizeRow } from "../core/normalize.js";
-import type { ForeignKey, JsonValue, Row, TableInfo, TableRef } from "../core/types.js";
+import type { CatalogTable, ForeignKey, JsonValue, Row, TableInfo, TableRef } from "../core/types.js";
 import { loadDriver } from "./load.js";
 import { databaseName, keyCondition } from "./sql.js";
 import type { DbAdapter } from "./types.js";
@@ -186,6 +186,47 @@ export async function connectMssql(url: URL): Promise<DbAdapter> {
         fk.refColumns.push(String(r.to_column));
       }
       return [...byId.values()];
+    },
+    async catalog() {
+      const cols = await query(
+        `SELECT SCHEMA_NAME(t.schema_id) AS sch, t.name AS tbl, c.name AS col,
+                COALESCE(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS base, c.max_length, c.precision, c.scale
+           FROM sys.tables t JOIN sys.columns c ON c.object_id = t.object_id
+          WHERE t.is_ms_shipped = 0 AND ISNULL(COLUMNPROPERTY(c.object_id, c.name, 'IsHidden'), 0) = 0
+          ORDER BY sch, tbl, c.column_id`,
+      );
+      // clustered and nonclustered row-store indexes, without filtered ones (their uniqueness covers some rows only)
+      const indexes = await query(
+        `SELECT SCHEMA_NAME(t.schema_id) AS sch, t.name AS tbl, i.index_id, i.is_primary_key, i.is_unique, c.name AS col
+           FROM sys.tables t
+           JOIN sys.indexes i ON i.object_id = t.object_id
+           JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0
+           JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+          WHERE t.is_ms_shipped = 0 AND i.type IN (1, 2) AND i.is_hypothetical = 0 AND i.has_filter = 0
+          ORDER BY sch, tbl, i.index_id, ic.key_ordinal`,
+      );
+      const tables = new Map<string, CatalogTable>();
+      for (const r of cols) {
+        const id = `${String(r.sch)}.${String(r.tbl)}`;
+        let t = tables.get(id);
+        if (!t) tables.set(id, (t = { table: { schema: String(r.sch), name: String(r.tbl) }, columns: [], primaryKey: [], indexes: [] }));
+        t.columns.push({ name: String(r.col), type: typeText(String(r.base), Number(r.max_length), Number(r.precision), Number(r.scale)) });
+      }
+      let current: { columns: string[]; unique: boolean } | undefined;
+      let currentId = "";
+      for (const r of indexes) {
+        const t = tables.get(`${String(r.sch)}.${String(r.tbl)}`);
+        if (!t) continue;
+        const id = `${String(r.sch)}.${String(r.tbl)}.${String(r.index_id)}`;
+        if (id !== currentId) {
+          currentId = id;
+          current = { columns: [], unique: Boolean(r.is_unique) };
+          t.indexes.push(current);
+          if (r.is_primary_key) t.primaryKey = current.columns;
+        }
+        current!.columns.push(String(r.col));
+      }
+      return [...tables.values()];
     },
     async countRows(t) {
       const rows = await query(`SELECT COUNT_BIG(*) AS n FROM ${name(t)}`);

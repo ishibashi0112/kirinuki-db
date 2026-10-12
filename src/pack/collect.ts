@@ -1,8 +1,17 @@
 import { MAX_PARAMS } from "../adapters/sql.js";
 import type { DbAdapter } from "../adapters/types.js";
-import type { ForeignKey, JsonValue, Row, TableInfo, TableRef } from "../core/types.js";
+import type { CatalogTable, ForeignKey, JsonValue, Row, TableInfo, TableRef } from "../core/types.js";
+import { resolveTable, tableId, tableLabel } from "./names.js";
+import { loadRelations, tableKey } from "./relations.js";
+
+export { resolveTable, tableId, tableLabel } from "./names.js";
 
 export const DEFAULT_MAX_ROWS = 1000;
+/**
+ * Most rows of a detail table followed from a row reached as a parent. Stock per item is a few rows;
+ * every customer of a company (a company code leading every key) is not part of an order.
+ */
+export const DETAIL_LIMIT = 100;
 
 export interface PackOptions {
   /** The start table as the user wrote it: orders, sales.orders (any letter case). */
@@ -19,6 +28,10 @@ export interface PackOptions {
   parentsOnly?: boolean;
   /** Most rows taken from one table. */
   maxRows?: number;
+  /** Guess relations from column names (see inferRelations). Default true. */
+  infer?: boolean;
+  /** A relations file's text (see parseRelations) and its name for messages. */
+  relations?: { name: string; text: string };
   now?: Date;
 }
 
@@ -37,9 +50,10 @@ export interface UnfollowedLink extends Link {
   /**
    * reverse: back down the foreign key a parent was reached through (other orders of the same item);
    * not-detail: a child table that isn't a detail and wasn't asked for; parents-only: a detail left out
-   * by `parentsOnly`; skipped: asked to skip the table; error: the table could not be read.
+   * by `parentsOnly`; too-many: a detail of a row reached as a parent with more than DETAIL_LIMIT rows;
+   * skipped: asked to skip the table; error: the table could not be read.
    */
-  reason: "reverse" | "not-detail" | "parents-only" | "skipped" | "error";
+  reason: "reverse" | "not-detail" | "parents-only" | "too-many" | "skipped" | "error";
   error?: string;
 }
 
@@ -63,6 +77,10 @@ export interface Pack {
   takenAt: Date;
   maxRows: number;
   parentsOnly: boolean;
+  /** Relations were guessed from column names too. */
+  inferred: boolean;
+  /** Name of the relations file used. */
+  relationsFile?: string;
   /** In the order they were reached: the start table first. */
   tables: PackTable[];
   followed: FollowedLink[];
@@ -78,8 +96,11 @@ export interface Pack {
  * - children (the rows referencing a row) when they are details of it — the foreign key is part of
  *   the child's primary key, like order_items (order_id, line_no) — or their table is in `children`;
  * - but never back down the foreign key a parent was reached through: from an item reached through
- *   an order line, the other orders' lines of the same item are not followed.
- * Each row is expanded once, when it is first reached. Breadth first, children before parents.
+ *   an order line, the other orders' lines of the same item are not followed;
+ * - and details of a row reached as a parent only when they are few (DETAIL_LIMIT), and not at all
+ *   when that parent was reached from one of its details (the other orders of an order's company).
+ * Relations are the declared foreign keys, those guessed from column names (`infer`), and those of a
+ * relations file. Each row is expanded once, when it is first reached. Breadth first, children before parents.
  */
 export async function collectPack(db: DbAdapter, options: PackOptions): Promise<Pack> {
   const maxRows = options.maxRows ?? DEFAULT_MAX_ROWS;
@@ -89,12 +110,19 @@ export async function collectPack(db: DbAdapter, options: PackOptions): Promise<
   const start = resolve(options.table);
   const children = new Set((options.children ?? []).map((t) => tableId(resolve(t))));
   const skip = new Set((options.skip ?? []).map((t) => tableId(resolve(t))));
-  const fks = await db.foreignKeys();
+  const infer = options.infer ?? true;
+  const { catalog, all: fks } = await loadRelations(db, tables, { infer, relations: options.relations });
 
+  const cataloged = new Map<string, CatalogTable>(catalog.map((t) => [tableId(t.table), t]));
   const infos = new Map<string, Promise<TableInfo>>();
   const describe = (t: TableRef) => {
     let info = infos.get(tableId(t));
-    if (!info) infos.set(tableId(t), (info = db.describeTable(t)));
+    if (!info) {
+      // a table without a primary key is keyed by its unique index, if it has one
+      const key = cataloged.get(tableId(t)) && tableKey(cataloged.get(tableId(t))!);
+      info = db.describeTable(t).then((i) => (i.primaryKey.length || !key ? i : { ...i, primaryKey: key.columns, keyFromIndex: true }));
+      infos.set(tableId(t), info);
+    }
     return info;
   };
 
@@ -142,6 +170,10 @@ export async function collectPack(db: DbAdapter, options: PackOptions): Promise<
     /** The foreign key this step's rows were reached through, going up to a parent or down to children. */
     up?: ForeignKey;
     down?: ForeignKey;
+    /** A step on the way here went up to a parent. */
+    viaParent?: boolean;
+    /** Reached by going up from one of this table's details (a company from its orders): its other details are someone else's. */
+    container?: boolean;
   }
   const queue: Step[] = [{ table: first, rows: take(first, startRows) }];
   const followed = new Map<string, FollowedLink & { reached: Set<string> }>();
@@ -151,9 +183,12 @@ export async function collectPack(db: DbAdapter, options: PackOptions): Promise<
     if (!unfollowed.has(linkId(l))) unfollowed.set(linkId(l), { ...l, reason, ...(error ? { error } : {}) });
   };
 
-  /** Brings in the rows of `target` whose `targetColumns` equal the `sourceColumns` of `rows`. */
-  const follow = async (link: Link, rows: Row[], sourceColumns: string[], target: TableRef, targetColumns: string[]) => {
-    const keys = distinctKeys(rows, sourceColumns);
+  /**
+   * Brings in the rows of `target` whose `targetColumns` equal the `sourceColumns` of `step`'s rows.
+   * With `few`, brings in nothing when there are more than that many.
+   */
+  const follow = async (link: Link, step: Step, sourceColumns: string[], target: TableRef, targetColumns: string[], few?: number) => {
+    const keys = distinctKeys(step.rows, sourceColumns);
     if (keys.length === 0) return;
     let info: TableInfo;
     let fetched: Row[] = [];
@@ -162,10 +197,14 @@ export async function collectPack(db: DbAdapter, options: PackOptions): Promise<
       info = await describe(target);
       const batch = Math.max(1, Math.floor(MAX_PARAMS / targetColumns.length));
       for (let i = 0; i < keys.length; i += batch) {
-        const got = await db.selectRows(target, targetColumns, keys.slice(i, i + batch), maxRows + 1);
+        const got = await db.selectRows(target, targetColumns, keys.slice(i, i + batch), (few ?? maxRows) + 1);
         // more related rows than the table may hold, whatever is in it already
         if (got.length > maxRows) overflow = true;
         fetched = fetched.concat(got);
+        if (few !== undefined && fetched.length > few) {
+          leaveOut(link, "too-many");
+          return;
+        }
       }
     } catch (err) {
       leaveOut(link, "error", (err as Error).message);
@@ -179,7 +218,16 @@ export async function collectPack(db: DbAdapter, options: PackOptions): Promise<
     for (const row of fetched) if (e.seen.has(rowKey(e.info, row))) f.reached.add(rowKey(e.info, row));
     f.rows = f.reached.size;
     followed.set(linkId(link), f);
-    if (fresh.length) queue.push({ table: e, rows: fresh, ...(link.direction === "parent" ? { up: link.fk } : { down: link.fk }) });
+    if (fresh.length) {
+      const up = link.direction === "parent";
+      queue.push({
+        table: e,
+        rows: fresh,
+        viaParent: step.viaParent || up,
+        container: up && isDetail(link.fk, step.table.info),
+        ...(up ? { up: link.fk } : { down: link.fk }),
+      });
+    }
   };
 
   for (let step = queue.shift(); step; step = queue.shift()) {
@@ -195,7 +243,8 @@ export async function collectPack(db: DbAdapter, options: PackOptions): Promise<
         leaveOut(link, "skipped");
         continue;
       }
-      if (!children.has(tableId(fk.from))) {
+      const asked = children.has(tableId(fk.from));
+      if (!asked) {
         let detail: boolean;
         try {
           detail = isDetail(fk, await describe(fk.from));
@@ -207,8 +256,13 @@ export async function collectPack(db: DbAdapter, options: PackOptions): Promise<
           leaveOut(link, detail ? "parents-only" : "not-detail");
           continue;
         }
+        // the other orders of the company an order belongs to
+        if (step.container) {
+          leaveOut(link, "reverse");
+          continue;
+        }
       }
-      await follow(link, step.rows, fk.refColumns, fk.from, fk.columns);
+      await follow(link, step, fk.refColumns, fk.from, fk.columns, step.viaParent && !asked ? DETAIL_LIMIT : undefined);
     }
     for (const fk of fks.filter((f) => tableId(f.from) === here)) {
       // the parent rows these rows were reached from are in the pack already
@@ -218,7 +272,7 @@ export async function collectPack(db: DbAdapter, options: PackOptions): Promise<
         leaveOut(link, "skipped");
         continue;
       }
-      await follow(link, step.rows, fk.columns, fk.to, fk.refColumns);
+      await follow(link, step, fk.columns, fk.to, fk.refColumns);
     }
   }
 
@@ -239,6 +293,8 @@ export async function collectPack(db: DbAdapter, options: PackOptions): Promise<
     takenAt: options.now ?? new Date(),
     maxRows,
     parentsOnly: Boolean(options.parentsOnly),
+    inferred: infer,
+    relationsFile: options.relations?.name,
     tables: packTables,
     followed: [...followed.values()].map(({ reached: _reached, ...l }) => l),
     unfollowed: [...unfollowed.entries()].filter(([id]) => !followed.has(id)).map(([, l]) => l),
@@ -246,36 +302,13 @@ export async function collectPack(db: DbAdapter, options: PackOptions): Promise<
   };
 }
 
-/** A child table is a detail of its parent when the foreign key is part of its primary key: order_items (order_id, line_no). */
+/**
+ * A child table is a detail of its parent when the foreign key leads its key: order_items (order_id, line_no)
+ * of orders, stock (item_cd, wh_cd) of items — but not of warehouses, nor a link table of the table its second column references.
+ */
 export function isDetail(fk: ForeignKey, child: TableInfo): boolean {
-  return child.primaryKey.length > 0 && fk.columns.every((c) => child.primaryKey.includes(c));
-}
-
-export const tableId = (t: TableRef) => (t.schema === undefined ? t.name : `${t.schema}.${t.name}`);
-
-/** The table's name as shown to people: with its schema only when that isn't the default one. */
-export const tableLabel = (t: TableRef, defaultSchema?: string) => (t.schema && t.schema !== defaultSchema ? `${t.schema}.${t.name}` : t.name);
-
-/** Finds a table the user named: orders or sales.orders, in any letter case (Oracle's names are upper case). */
-export function resolveTable(input: string, tables: TableRef[], defaultSchema: string | undefined, dialect?: string): TableRef {
-  const wanted = input.trim();
-  const dot = wanted.indexOf(".");
-  const schema = dot > 0 ? wanted.slice(0, dot) : undefined;
-  const name = dot > 0 ? wanted.slice(dot + 1) : wanted;
-  const same = (a: string | undefined, b: string) => a !== undefined && a.toLowerCase() === b.toLowerCase();
-  let found = tables.filter((t) => same(t.name, name) && (schema === undefined || same(t.schema, schema)));
-  if (found.length > 1) {
-    const exact = found.filter((t) => t.name === name);
-    if (exact.length) found = exact;
-  }
-  if (found.length > 1 && schema === undefined) {
-    const inDefault = found.filter((t) => t.schema === defaultSchema);
-    if (inDefault.length === 1) found = inDefault;
-  }
-  if (found.length === 1) return found[0]!;
-  if (found.length > 1) throw new Error(`${input} は複数のスキーマにあります: ${found.map((t) => tableId(t)).join(", ")}。スキーマ付きで指定してください`);
-  const hint = dialect === "oracle" ? `(ほかのユーザーのテーブルなら、接続URLに ?schema=所有者 を付けてください)` : "";
-  throw new Error(`テーブル ${input} が見つかりません${hint}`);
+  const lead = child.primaryKey.slice(0, fk.columns.length);
+  return lead.length === fk.columns.length && fk.columns.every((c) => lead.includes(c));
 }
 
 function resolveColumn(input: string, info: TableInfo): string {

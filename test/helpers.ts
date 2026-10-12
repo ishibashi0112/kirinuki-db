@@ -11,10 +11,15 @@ import { salesSchema } from "./fixtures/sales.js";
 export const tempDir = () => mkdtempSync(join(tmpdir(), "kirinuki-"));
 
 /** The sales database as a SQLite file. */
-export function createSalesDb(): string {
-  const file = join(tempDir(), "sales.db");
+export function createSalesDb(options: { foreignKeys?: boolean } = {}): string {
+  return createDb(salesSchema("sqlite", options), "sales.db");
+}
+
+/** A SQLite file made by these statements. */
+export function createDb(statements: string[], name = "test.db"): string {
+  const file = join(tempDir(), name);
   const db = new DatabaseSync(file);
-  for (const sql of salesSchema("sqlite")) db.exec(sql);
+  for (const sql of statements) db.exec(sql);
   db.close();
   return file;
 }

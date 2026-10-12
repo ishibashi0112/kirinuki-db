@@ -13,6 +13,7 @@ import { loadDriver } from "../src/adapters/load.js";
 import type { Row } from "../src/core/types.js";
 import { packWorkbook } from "../src/export/workbook.js";
 import { collectPack } from "../src/pack/collect.js";
+import { loadRelations } from "../src/pack/relations.js";
 import { type Dialect, salesComments, salesSchema, TABLES } from "./fixtures/sales.js";
 import { picture, readWorkbook } from "./helpers.js";
 
@@ -128,6 +129,8 @@ const TYPES: Record<Exclude<Dialect, "sqlite">, Record<string, string>> = {
   oracle: { order_no: "VARCHAR2(12)", status: "CHAR(2)", ordered_at: "DATE" },
 };
 
+const PRICES = ["A-100/2026-04-01 00:00:00", "A-100/2026-10-01 00:00:00", "B-210/2026-04-01 00:00:00"];
+
 const lower = (r: Row | undefined) => Object.fromEntries(Object.entries(r ?? {}).map(([k, v]) => [k.toLowerCase(), typeof v === "string" ? v.trimEnd() : v]));
 /** Key values without the padding of CHAR columns. */
 const trimmed = (p: Record<string, string[]>) => Object.fromEntries(Object.entries(p).map(([t, keys]) => [t, keys.map((k) => k.replace(/ +(?=\/|$)/g, ""))]));
@@ -149,11 +152,25 @@ for (const [dialect, writer] of Object.entries(writers) as [Exclude<Dialect, "sq
             customers: ["7"],
             items: ["A-100", "B-210"],
             stock: ["A-100/10", "A-100/20", "B-210/10"],
+            item_prices: PRICES,
             categories: ["1", "2"],
             warehouses: ["10", "20"],
           });
           expect(pack.unfollowed.filter((l) => l.reason === "not-detail").map((l) => l.fk.from.name.toLowerCase()).sort()).toEqual(["categories", "shipments"]);
-          expect(pack.tables.map((t) => t.totalRows)).toEqual([3, 5, 2, 3, 4, 3, 2]);
+          expect(Object.fromEntries(pack.tables.map((t) => [t.info.table.name.toLowerCase(), t.totalRows]))).toEqual({
+            orders: 3,
+            order_items: 5,
+            customers: 2,
+            items: 3,
+            stock: 4,
+            item_prices: 3,
+            categories: 3,
+            warehouses: 2,
+          });
+          // keyed by its unique index, found by the name of its column
+          const prices = pack.tables.find((t) => /^item_prices$/i.test(t.info.table.name))!;
+          expect(prices.info.keyFromIndex).toBe(true);
+          expect(prices.info.primaryKey.map((c) => c.toLowerCase())).toEqual(["item_cd", "valid_from"]);
 
           const orders = pack.tables[0]!;
           expect(lower(orders.rows[0])).toEqual({ order_id: 1042, order_no: "S-1042", customer_id: 7, status: "02", order_kbn: "1", ordered_at: "2026-10-01 10:02:11" });
@@ -184,18 +201,60 @@ for (const [dialect, writer] of Object.entries(writers) as [Exclude<Dialect, "sq
             items: ["B-210"],
             customers: ["7"],
             stock: ["B-210/10"],
+            item_prices: ["B-210/2026-04-01 00:00:00"],
             categories: ["1"],
             warehouses: ["10"],
           });
           expect(picture(await collectPack(db, { table: "orders", values: ["S-1044"], by: ["order_no"], parentsOnly: true })).orders).toEqual(["1044"]);
           expect(picture(await collectPack(db, { table: "orders", values: ["2026-10-01 11:15:40"], by: ["ordered_at"], parentsOnly: true })).orders).toEqual(["1043"]);
           expect(picture(await collectPack(db, { table: "items", values: ["320"], by: ["unit_price"], parentsOnly: true })).items).toEqual(["B-210"]);
-          expect(trimmed(picture(await collectPack(db, { table: "warehouses", values: ["20"] })))).toEqual({
+          expect(trimmed(picture(await collectPack(db, { table: "warehouses", values: ["20"], children: ["stock"] })))).toEqual({
             warehouses: ["20"],
             stock: ["A-100/20"],
             items: ["A-100"],
             categories: ["1", "2"],
           });
+        } finally {
+          await db.close();
+        }
+      } finally {
+        for (const t of TABLES) await w.run(`DROP TABLE ${t}`).catch(() => undefined);
+        await w.close();
+      }
+    });
+
+    it("finds the relations of a database without foreign keys, as a SELECT-only user", { timeout: 120_000 }, async () => {
+      const w = await writer(url!);
+      try {
+        for (const t of TABLES) await w.run(`DROP TABLE ${t}`).catch(() => undefined);
+        for (const sql of salesSchema(dialect, { foreignKeys: false })) await w.run(sql);
+        const db = await connect(await w.readOnlyUrl(TABLES));
+        try {
+          expect(await db.foreignKeys()).toEqual([]);
+          const pack = await collectPack(db, { table: "orders", values: ["1042"] });
+          expect(trimmed(picture(pack))).toEqual({
+            orders: ["1042"],
+            order_items: ["1042/1", "1042/2"],
+            customers: ["7"],
+            items: ["A-100", "B-210"],
+            stock: ["A-100/10", "A-100/20", "B-210/10"],
+            item_prices: PRICES,
+            categories: ["1", "2"],
+            warehouses: ["10", "20"],
+          });
+          expect(pack.followed.every((l) => l.fk.source === "inferred")).toBe(true);
+          const { all } = await loadRelations(db, await db.listTables(), { infer: true });
+          const relations = all.map((fk) => `${fk.from.name}(${fk.columns}) -> ${fk.to.name}(${fk.refColumns})`.toLowerCase()).sort();
+          expect(relations).toEqual([
+            "item_prices(item_cd) -> items(item_cd)",
+            "items(category_id) -> categories(category_id)",
+            "order_items(item_cd) -> items(item_cd)",
+            "order_items(order_id) -> orders(order_id)",
+            "orders(customer_id) -> customers(customer_id)",
+            "shipments(order_id) -> orders(order_id)",
+            "stock(item_cd) -> items(item_cd)",
+            "stock(wh_cd) -> warehouses(wh_cd)",
+          ]);
         } finally {
           await db.close();
         }

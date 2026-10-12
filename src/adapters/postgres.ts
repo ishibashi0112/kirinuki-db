@@ -1,5 +1,5 @@
 import { exactDecimal, normalizeRow } from "../core/normalize.js";
-import type { Row, TableInfo, TableRef } from "../core/types.js";
+import type { CatalogTable, Row, TableInfo, TableRef } from "../core/types.js";
 import { loadDriver } from "./load.js";
 import { databaseName, keyCondition } from "./sql.js";
 import type { DbAdapter } from "./types.js";
@@ -108,6 +108,26 @@ export async function connectPostgres(url: URL): Promise<DbAdapter> {
         refColumns: names(r.ref_columns),
       }));
     },
+    async catalog(): Promise<CatalogTable[]> {
+      const tables = `c.relkind IN ('r', 'p') AND NOT c.relispartition
+            AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_%'`;
+      const cols = await query(
+        `SELECT n.nspname AS schema, c.relname AS name, a.attname AS col, format_type(a.atttypid, a.atttypmod) AS type
+           FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE ${tables} AND a.attnum > 0 AND NOT a.attisdropped
+          ORDER BY 1, 2, a.attnum`,
+      );
+      // key columns only (not INCLUDE ones); an expression index has a 0 among its columns
+      const indexes = await query(
+        `SELECT n.nspname AS schema, c.relname AS name, i.indisprimary AS is_primary, i.indisunique AS is_unique,
+                (SELECT array_agg(a.attname ORDER BY k.ord) FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                   JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum WHERE k.ord <= i.indnkeyatts) AS columns
+           FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE ${tables} AND NOT (0 = ANY (i.indkey::int2[])) AND i.indpred IS NULL
+          ORDER BY 1, 2, i.indexrelid`,
+      );
+      return catalogOf(cols, indexes);
+    },
     async countRows(t) {
       return Number((await query(`SELECT COUNT(*) AS n FROM ${name(t)}`))[0]?.n ?? 0);
     },
@@ -127,6 +147,25 @@ export async function connectPostgres(url: URL): Promise<DbAdapter> {
       await pool.end();
     },
   };
+}
+
+/** Builds the catalog from rows of (schema, name, col, type) and (schema, name, is_primary, is_unique, columns). */
+function catalogOf(cols: Record<string, unknown>[], indexes: Record<string, unknown>[]): CatalogTable[] {
+  const tables = new Map<string, CatalogTable>();
+  for (const r of cols) {
+    const id = `${String(r.schema)}.${String(r.name)}`;
+    let t = tables.get(id);
+    if (!t) tables.set(id, (t = { table: { schema: String(r.schema), name: String(r.name) }, columns: [], primaryKey: [], indexes: [] }));
+    t.columns.push({ name: String(r.col), type: String(r.type) });
+  }
+  for (const r of indexes) {
+    const t = tables.get(`${String(r.schema)}.${String(r.name)}`);
+    if (!t || r.columns === null) continue;
+    const columns = names(r.columns);
+    if (r.is_primary) t.primaryKey = columns;
+    t.indexes.push({ columns, unique: Boolean(r.is_unique) });
+  }
+  return [...tables.values()];
 }
 
 const text = (v: unknown) => (typeof v === "string" && v.trim() ? v : undefined);

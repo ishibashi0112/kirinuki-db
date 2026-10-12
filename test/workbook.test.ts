@@ -16,7 +16,7 @@ describe("packWorkbook", () => {
   it("writes the front sheet, the table and column descriptions, then one sheet per table", async () => {
     const pack = await collectPack(db, { table: "orders", values: ["1042"], now });
     const book = readWorkbook(await packWorkbook(pack));
-    expect([...book.keys()]).toEqual(["はじめに", "テーブル説明", "列説明", "orders", "order_items", "customers", "items", "stock", "categories", "warehouses"]);
+    expect([...book.keys()]).toEqual(["はじめに", "テーブル説明", "列説明", "orders", "order_items", "customers", "items", "stock", "item_prices", "categories", "warehouses"]);
 
     const front = book.get("はじめに")!;
     expect(front[0]).toEqual(["項目", "内容"]);
@@ -33,11 +33,15 @@ describe("packWorkbook", () => {
       "orders → customers(参照先:orders.customer_id = customers.customer_id):1行",
       "order_items → items(参照先:order_items.item_cd = items.item_cd):2行",
       "items → stock(明細:stock.item_cd = items.item_cd):3行",
+      "items → item_prices(明細:item_prices.item_cd = items.item_cd、列名からの推測):3行",
       "items → categories(参照先:items.category_id = categories.category_id):2行",
       "stock → warehouses(参照先:stock.wh_cd = warehouses.wh_cd):2行",
       "categories → categories(参照先:categories.parent_id = categories.category_id):1行",
     ]);
-    expect(lines("たどり方")[0]).toContain("明細(主キーに親のキーを含むもの)だけをたどりました。1テーブルあたり最大1000行です。");
+    expect(lines("たどり方")).toEqual([
+      "DBに宣言された外部キー、テーブルの主キーと同じ名前の列(列名からの推測。まちがっていることがあります)をたどりました。" +
+        "参照先(マスタなど)はすべてたどり、参照元の子テーブルは明細(主キーの先頭に親のキーがあるもの)だけをたどりました。1テーブルあたり最大1000行です。",
+    ]);
     expect(lines("入っていないもの")).toEqual([
       "同じ customers を参照している、ほかの orders の行(起点に関係しないもの)",
       "同じ items を参照している、ほかの order_items の行(起点に関係しないもの)",
@@ -45,7 +49,7 @@ describe("packWorkbook", () => {
       "同じ warehouses を参照している、ほかの stock の行(起点に関係しないもの)",
       "orders を参照している子テーブル shipments の行(たどっていません)",
       "categories を参照している子テーブル categories の行(たどっていません)",
-      "外部キーが宣言されていない関係でつながる行(列名や値が似ていても、たどっていません)",
+      "外部キーも、主キーと同じ名前の列もない関係でつながる行(たどっていません)",
     ]);
     expect(lines("読み方")).toHaveLength(2);
 
@@ -56,6 +60,7 @@ describe("packWorkbook", () => {
       ["customers", null, 1, 2, "orders の参照先"],
       ["items", null, 2, 3, "order_items の参照先"],
       ["stock", null, 3, 4, "items の明細"],
+      ["item_prices", null, 3, 3, "items の明細"],
       ["categories", null, 2, 3, "items の参照先"],
       ["warehouses", null, 2, 2, "stock の参照先"],
     ]);
@@ -65,7 +70,8 @@ describe("packWorkbook", () => {
     expect(columns).toContainEqual(["orders", "customer_id", "INTEGER", null, null, "→ customers.customer_id"]);
     expect(columns).toContainEqual(["order_items", "order_id", "INTEGER", "主キー(1/2)", null, "→ orders.order_id"]);
     expect(columns).toContainEqual(["orders", "order_id", "INTEGER", "主キー", null, null]);
-    expect(columns).toHaveLength(1 + 6 + 4 + 3 + 4 + 3 + 3 + 2);
+    expect(columns).toContainEqual(["item_prices", "item_cd", "TEXT", "一意索引(1/2)", null, "→ items.item_cd(推測)"]);
+    expect(columns).toHaveLength(1 + 6 + 4 + 3 + 4 + 3 + 3 + 3 + 2);
 
     expect(book.get("orders")).toEqual([
       ["order_id", "order_no", "customer_id", "status", "order_kbn", "ordered_at"],
@@ -82,7 +88,7 @@ describe("packWorkbook", () => {
   it("says when only parents were followed", async () => {
     const pack = await collectPack(db, { table: "orders", values: ["1043"], parentsOnly: true, now });
     const front = readWorkbook(await packWorkbook(pack)).get("はじめに")!.map((r) => r[1]);
-    expect(front).toContain("宣言されている外部キーだけをたどりました。参照先(マスタなど)はすべてたどり、参照元の子テーブルはたどっていません。1テーブルあたり最大1000行です。");
+    expect(front.find((l) => String(l).includes("をたどりました。"))).toContain("参照先(マスタなど)はすべてたどり、参照元の子テーブルはたどっていません。");
     expect(front).toContain("orders を参照している子テーブル order_items、shipments の行(たどっていません)");
   });
 
@@ -100,7 +106,7 @@ describe("packWorkbook", () => {
     expect(front).toContain("items → order_items(子:order_items.item_cd = items.item_cd):1行");
     expect(front).toContain("warehouses の行(入れないよう指定されました)");
     expect(front).toContain("order_items の1行目より後の行(関係する行が1行を超えたため打ち切りました)");
-    expect(front.find((l) => String(l).startsWith("宣言されている外部キーだけ"))).toContain("と指定されたものだけをたどりました。1テーブルあたり最大1行です。");
+    expect(front.find((l) => String(l).includes("をたどりました。"))).toContain("と指定されたものだけをたどりました。1テーブルあたり最大1行です。");
     const tables = readWorkbook(await packWorkbook(pack)).get("テーブル説明")!;
     expect(tables[2]).toEqual(["order_items", null, "1(上限で打ち切り)", 5, "items の子"]);
   });

@@ -1,5 +1,5 @@
 import type { ForeignKey, TableRef } from "../core/types.js";
-import { isDetail, type Pack, type PackTable, tableId, tableLabel, type UnfollowedLink } from "../pack/collect.js";
+import { DETAIL_LIMIT, isDetail, type Pack, type PackTable, tableId, tableLabel, type UnfollowedLink } from "../pack/collect.js";
 import { type CellStyle, sheetRef, Workbook } from "./xlsx.js";
 
 const HEAD: CellStyle = { bold: true, fill: "DDEBF7", border: true };
@@ -36,8 +36,15 @@ export function packWorkbook(pack: Pack): Promise<Buffer> {
     ? asked
       ? "参照元の子テーブルは指定されたものだけをたどりました。"
       : "参照元の子テーブルはたどっていません。"
-    : `参照元の子テーブルは明細(主キーに親のキーを含むもの)${asked ? "と指定されたもの" : ""}だけをたどりました。`;
-  item("たどり方", [`宣言されている外部キーだけをたどりました。参照先(マスタなど)はすべてたどり、${childRule}1テーブルあたり最大${pack.maxRows}行です。`]);
+    : `参照元の子テーブルは明細(主キーの先頭に親のキーがあるもの)${asked ? "と指定されたもの" : ""}だけをたどりました。`;
+  const sources = [
+    "DBに宣言された外部キー",
+    ...(pack.inferred ? ["テーブルの主キーと同じ名前の列(列名からの推測。まちがっていることがあります)"] : []),
+    ...(pack.relationsFile ? [`関係ファイル(${pack.relationsFile})に書かれた関係`] : []),
+  ];
+  item("たどり方", [
+    `${sources.join("、")}をたどりました。参照先(マスタなど)はすべてたどり、${childRule}1テーブルあたり最大${pack.maxRows}行です。`,
+  ]);
   item("入っていないもの", missingLines(pack, name));
   item("読み方", [
     "「テーブル説明」「列説明」でデータの意味を確かめてから、各テーブルのシートを見てください。",
@@ -72,7 +79,7 @@ export function packWorkbook(pack: Pack): Promise<Buffer> {
         name(t.info.table),
         c.name,
         c.type,
-        k < 0 ? "" : key.length > 1 ? `主キー(${k + 1}/${key.length})` : "主キー",
+        k < 0 ? "" : `${t.info.keyFromIndex ? "一意索引" : "主キー"}${key.length > 1 ? `(${k + 1}/${key.length})` : ""}`,
         { v: c.comment, s: WRAP },
         { v: refs.get(c.name)?.join(" / "), s: WRAP },
       );
@@ -98,10 +105,13 @@ export function packWorkbook(pack: Pack): Promise<Buffer> {
 
 /** orders → order_items(明細:order_items.order_id = orders.order_id) */
 function linkText(fk: ForeignKey, direction: "parent" | "child", inPack: Map<string, PackTable>, name: (t: TableRef) => string): string {
-  const join = fk.columns.map((c, i) => `${name(fk.from)}.${c} = ${name(fk.to)}.${fk.refColumns[i]}`).join(" かつ ");
+  const join = fk.columns.map((c, i) => `${name(fk.from)}.${c} = ${name(fk.to)}.${fk.refColumns[i]}`).join(" かつ ") + sourceNote(fk);
   if (direction === "parent") return `${name(fk.from)} → ${name(fk.to)}(参照先:${join})`;
   return `${name(fk.to)} → ${name(fk.from)}(${detailOf(fk, inPack) ? "明細" : "子"}:${join})`;
 }
+
+/** Where a relation that isn't a declared foreign key comes from. */
+const sourceNote = (fk: ForeignKey) => (fk.source === "inferred" ? "、列名からの推測" : fk.source === "file" ? "、関係ファイル" : "");
 
 const detailOf = (fk: ForeignKey, inPack: Map<string, PackTable>) => {
   const child = inPack.get(tableId(fk.from));
@@ -119,7 +129,7 @@ function referencesOf(t: PackTable, pack: Pack, name: (t: TableRef) => string): 
   const refs = new Map<string, string[]>();
   for (const fk of pack.foreignKeys.filter((fk) => tableId(fk.from) === tableId(t.info.table))) {
     fk.columns.forEach((c, i) => {
-      const text = `→ ${name(fk.to)}.${fk.refColumns[i]}`;
+      const text = `→ ${name(fk.to)}.${fk.refColumns[i]}${fk.source === "inferred" ? "(推測)" : fk.source === "file" ? "(関係ファイル)" : ""}`;
       const list = refs.get(c) ?? [];
       if (!list.includes(text)) refs.set(c, [...list, text]);
     });
@@ -142,6 +152,15 @@ function missingLines(pack: Pack, name: (t: TableRef) => string): string[] {
     children.set(tableId(l.fk.to), c);
   }
   for (const c of children.values()) lines.push(`${name(c.parent)} を参照している子テーブル ${c.tables.join("、")} の行(たどっていません)`);
+  const many = new Map<string, { parent: TableRef; tables: string[] }>();
+  for (const l of byReason(["too-many"])) {
+    const c = many.get(tableId(l.fk.to)) ?? { parent: l.fk.to, tables: [] };
+    if (!c.tables.includes(name(l.fk.from))) c.tables.push(name(l.fk.from));
+    many.set(tableId(l.fk.to), c);
+  }
+  for (const c of many.values()) {
+    lines.push(`${name(c.parent)} の明細 ${c.tables.join("、")} の行(${DETAIL_LIMIT}行を超えるため入れていません)`);
+  }
   for (const l of byReason(["skipped"])) {
     lines.push(`${name(l.direction === "parent" ? l.fk.to : l.fk.from)} の行(入れないよう指定されました)`);
   }
@@ -151,7 +170,11 @@ function missingLines(pack: Pack, name: (t: TableRef) => string): string[] {
   for (const t of pack.tables.filter((t) => t.truncated)) {
     lines.push(`${name(t.info.table)} の${pack.maxRows}行目より後の行(関係する行が${pack.maxRows}行を超えたため打ち切りました)`);
   }
-  lines.push("外部キーが宣言されていない関係でつながる行(列名や値が似ていても、たどっていません)");
+  lines.push(
+    pack.inferred
+      ? "外部キーも、主キーと同じ名前の列もない関係でつながる行(たどっていません)"
+      : "外部キーが宣言されていない関係でつながる行(列名や値が似ていても、たどっていません)",
+  );
   // a table skipped or unreadable through two foreign keys is one line
   return [...new Set(lines)];
 }

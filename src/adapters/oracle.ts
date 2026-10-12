@@ -1,5 +1,5 @@
 import { exactDecimal, normalizeRow } from "../core/normalize.js";
-import type { ForeignKey, JsonValue, Row, TableInfo, TableRef } from "../core/types.js";
+import type { CatalogTable, ForeignKey, JsonValue, Row, TableInfo, TableRef } from "../core/types.js";
 import { loadDriver } from "./load.js";
 import { databaseName, keyCondition } from "./sql.js";
 import type { DbAdapter } from "./types.js";
@@ -189,6 +189,52 @@ export async function connectOracle(url: URL): Promise<DbAdapter> {
         fk.refColumns.push(String(r.R_COLUMN));
       }
       return [...byName.values()];
+    },
+    async catalog() {
+      const binds = { owner };
+      const cols = await exec(
+        `SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.DATA_LENGTH, c.CHAR_LENGTH, c.CHAR_USED, c.DATA_PRECISION, c.DATA_SCALE
+           FROM ALL_TAB_COLUMNS c JOIN ALL_TABLES t ON t.OWNER = c.OWNER AND t.TABLE_NAME = c.TABLE_NAME
+          WHERE c.OWNER = :owner AND c.COLUMN_ID IS NOT NULL AND t.NESTED = 'NO' AND t.SECONDARY = 'N'
+          ORDER BY c.TABLE_NAME, c.COLUMN_ID`,
+        binds,
+      );
+      const keys = await exec(
+        `SELECT c.TABLE_NAME, cc.COLUMN_NAME FROM ALL_CONSTRAINTS c
+           JOIN ALL_CONS_COLUMNS cc ON cc.OWNER = c.OWNER AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
+          WHERE c.CONSTRAINT_TYPE = 'P' AND c.OWNER = :owner
+          ORDER BY c.TABLE_NAME, cc.POSITION`,
+        binds,
+      );
+      const indexes = await exec(
+        `SELECT i.TABLE_NAME, i.INDEX_NAME, i.UNIQUENESS, ic.COLUMN_NAME
+           FROM ALL_INDEXES i JOIN ALL_IND_COLUMNS ic ON ic.INDEX_OWNER = i.OWNER AND ic.INDEX_NAME = i.INDEX_NAME
+          WHERE i.TABLE_OWNER = :owner AND i.TABLE_TYPE = 'TABLE'
+          ORDER BY i.TABLE_NAME, i.INDEX_NAME, ic.COLUMN_POSITION`,
+        binds,
+      );
+      const tables = new Map<string, CatalogTable>();
+      for (const r of cols) {
+        const name = String(r.TABLE_NAME);
+        let t = tables.get(name);
+        if (!t) tables.set(name, (t = { table: { schema: owner, name }, columns: [], primaryKey: [], indexes: [] }));
+        t.columns.push({ name: String(r.COLUMN_NAME), type: typeText(r) });
+      }
+      for (const r of keys) tables.get(String(r.TABLE_NAME))?.primaryKey.push(String(r.COLUMN_NAME));
+      const byIndex = new Map<string, { table: CatalogTable; columns: string[]; unique: boolean }>();
+      for (const r of indexes) {
+        const t = tables.get(String(r.TABLE_NAME));
+        if (!t) continue;
+        const id = `${String(r.TABLE_NAME)}.${String(r.INDEX_NAME)}`;
+        let i = byIndex.get(id);
+        if (!i) byIndex.set(id, (i = { table: t, columns: [], unique: r.UNIQUENESS === "UNIQUE" }));
+        i.columns.push(String(r.COLUMN_NAME));
+      }
+      // a function-based index lists hidden SYS_NC… columns instead of an expression
+      for (const { table, columns, unique } of byIndex.values()) {
+        if (columns.every((c) => table.columns.some((col) => col.name === c))) table.indexes.push({ columns, unique });
+      }
+      return [...tables.values()];
     },
     async countRows(t) {
       return Number((await exec(`SELECT COUNT(*) AS N FROM ${name(t)}`))[0]?.N ?? 0);

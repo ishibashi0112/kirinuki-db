@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 import { normalizeRow } from "../core/normalize.js";
-import type { ForeignKey, Row, TableInfo, TableRef } from "../core/types.js";
+import type { CatalogTable, ForeignKey, Row, TableInfo, TableRef } from "../core/types.js";
 import { keyCondition } from "./sql.js";
 import type { DbAdapter } from "./types.js";
 
@@ -62,6 +62,21 @@ export async function connectSqlite(path: string): Promise<DbAdapter> {
         }
       }
       return fks;
+    },
+    async catalog(): Promise<CatalogTable[]> {
+      return tables().map((name) => {
+        const cols = columnsOf({ name });
+        const indexes = all(`PRAGMA index_list(${q(name)})`).flatMap((i) => {
+          const parts = all(`PRAGMA index_info(${q(String(i.name))})`).sort((a, b) => Number(a.seqno) - Number(b.seqno));
+          // an expression has no column name
+          if (parts.length === 0 || parts.some((p) => p.name === null)) return [];
+          return [{ columns: parts.map((p) => String(p.name)), unique: Number(i.unique) === 1 }];
+        });
+        const key = primaryKey({ name });
+        // an INTEGER PRIMARY KEY is the rowid: it has no index of its own
+        if (key.length && !indexes.some((i) => i.columns.join() === key.join())) indexes.unshift({ columns: key, unique: true });
+        return { table: { name }, columns: cols.map((c) => ({ name: String(c.name), type: String(c.type ?? "") })), primaryKey: key, indexes };
+      });
     },
     async countRows(t) {
       return Number(all(`SELECT COUNT(*) AS n FROM ${q(t.name)}`)[0]?.n ?? 0);
